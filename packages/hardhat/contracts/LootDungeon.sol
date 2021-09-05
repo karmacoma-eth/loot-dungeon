@@ -3,205 +3,284 @@ pragma solidity >=0.8.0 <0.9.0;
 
 import "hardhat/console.sol";
 import "@openzeppelin/contracts/access/Ownable.sol"; //https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/access/Ownable.sol
+import "@openzeppelin/contracts/interfaces/IERC721.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
 
-// TODO: some kind of datastructure that abstracts whether we are dealing with real or synth loot
-// making "enterWithSynth" and "enterWithReal" is getting old
 
-// TODO: support for parties, i.e. canEnter(address[] player)
-interface Dungeon {
-    function name() pure external returns(string);
-
-    function canEnter(address player) pure external returns(bool, string);
-
-    // not responsible for checking the contract address or ownership
-    // could use something like LootComponents.sol to check for specific attributes
-    function canEnterWithRealLoot(address player, address contractAddress, uint tokenId) pure external returns(bool, string);
-
-    // in seconds, so that we can use built-in Solidity time units
-    function getTimeToComplete() pure external returns(uint);
-
-    // returns [low, high] 
-    function getXPReward() pure external returns(uint, uint);
+// data structure that abstracts whether we are dealing with real or synth loot
+struct Player {
+    address walletAddress;
+    address contractAddress;
+    uint tokenId;
 }
 
-// TODO: how can we support more types of rewards like resources? -> separate timelocking logic from accruing a rewards balance. That way, a dungeon can return a list of rewards or different reward kinds!
-contract LootXP is Ownable {
-    using Address for address;
 
-    address constant LOOT_ADDRESS = 0xFF9C1b15B16263C61d017ee9F65C50e4AE0113D7;
+struct PendingReward {
+    uint unlockTimestamp;
+    address rewardContract;
+    uint minAmount;
+    uint maxAmount;
+}
 
-    struct PendingXP {
-        uint unlockTimestamp;
-        uint reward;
+
+library PlayerFunctions {
+    function isSynthetic(Player memory player) internal pure returns(bool) {
+        return player.contractAddress == address(0);
     }
+
+    function isValid(Player memory player) internal view returns(bool) {
+        return isSynthetic(player) || IERC721(player.contractAddress).ownerOf(player.tokenId) == player.walletAddress;
+    }
+
+    function toCompactForm(Player memory player) internal pure returns(uint) {
+        if (isSynthetic(player)) {
+            return uint(uint160(player.walletAddress));
+        }
+
+        return uint(player.tokenId << 160) | uint(uint160(player.contractAddress));
+    }
+
+    function owner(Player memory player) internal view returns(address) {
+        if (isSynthetic(player)) {
+            return player.walletAddress;
+        }
+
+        return IERC721(player.contractAddress).ownerOf(player.tokenId);
+    }
+}
+
+
+// TODO: chance of success
+// TODO: support for parties, i.e. canEnter(address[] player)
+interface Adventure {
+    function name() pure external returns(string memory);
+
+    function canEnter(Player calldata player) view external returns(bool, string memory);
+
+    // in seconds, so that we can use built-in Solidity time units
+    function getTimeToComplete() view external returns(uint);
+
+    function getReward(Player calldata player) view external returns(PendingReward memory);
+}
+
+
+interface Reward {
+    function name() pure external returns(string memory);
+    function accrue(Player calldata player, uint amount) external;
+    function balance(Player calldata player) external returns(uint);
+}
+
+
+contract AdventureRegistry is Ownable {
+    address constant LOOT_ADDRESS = 0xFF9C1b15B16263C61d017ee9F65C50e4AE0113D7;
+    address constant MORE_LOOT_ADDRESS = 0x1dfe7Ca09e99d10835Bf73044a23B73Fc20623DF;
+
+    using Address for address;
+    using PlayerFunctions for Player;
+    
+    // initially just loot and mloot, but expandable
+    mapping(address => bool) levelableContracts;
+
+    // an adventure is a contract that is allowed to timelock a player
+    mapping(address => bool) adventures;
+
+    // a reward is some balance that can be increased by completing adventures
+    mapping(address => bool) rewards;
+
+    mapping(uint => PendingReward) pending;
+
+    event RewardsCollected(address collector, Player player, address rewardContract, uint amount);
+    event AdventureStarted(address adventureStarter, Player player, Adventure adventure, PendingReward pendingReward);
+
+    constructor() {
+        levelableContracts[LOOT_ADDRESS] = true;
+        levelableContracts[MORE_LOOT_ADDRESS] = true;
+    }
+
+    function setLevelable(address contractAddress, bool levelable) external onlyOwner {
+        require(contractAddress.isContract(), "contractAddress must be a contract");
+        levelableContracts[contractAddress] = levelable;
+    }
+
+    function setAdventure(address contractAddress, bool approved) external onlyOwner {
+        require(contractAddress.isContract(), "contractAddress must be a contract");
+        adventures[contractAddress] = approved;
+    }
+
+    function setRewards(address contractAddress, bool approved) external onlyOwner {
+        require(contractAddress.isContract(), "contractAddress must be a contract");
+        rewards[contractAddress] = approved;
+    }
+
+    function hasPendingRewards(Player memory player) public view returns(bool) {
+        return pending[player.toCompactForm()].unlockTimestamp != 0;
+    }
+
+    function pendingRewardsReady(Player memory player) public view returns(bool) {
+        return pending[player.toCompactForm()].unlockTimestamp <= block.timestamp;
+    }
+
+    // note: anybody can collect rewards on behalf of a player (why not?)
+    function collectPendingRewards(Player memory player) public {
+        require(hasPendingRewards(player), "player has no pending rewards");
+        require(pendingRewardsReady(player), "rewards are not ready to be collected");
+
+        PendingReward storage pendingReward = pending[player.toCompactForm()];
+        uint rewardAmount = somewhatRandomInRange(pendingReward.minAmount, pendingReward.maxAmount);
+
+        Reward(pendingReward.rewardContract).accrue(player, rewardAmount);
+
+        emit RewardsCollected(msg.sender, player, pendingReward.rewardContract, rewardAmount);
+
+        pendingReward.unlockTimestamp = 0;
+        pendingReward.rewardContract = address(0);
+        pendingReward.minAmount = 0;
+        pendingReward.maxAmount = 0;
+    }
+
+    function startAdventure(Player memory player, Adventure adventure) external {
+        require(adventures[address(adventure)], "can only be called from a real Adventure, for adventurers");
+
+        (bool canEnter, string memory reason) = adventure.canEnter(player);
+        require(canEnter, reason);
+
+        require(player.isValid());
+        require(player.owner() == msg.sender, "msg.sender must be the owner of this player");
+
+        require(levelableContracts[player.contractAddress], "not a levelable contract");
+
+        if (hasPendingRewards(player)) {
+            require(pendingRewardsReady(player), "player is already in an adventure");
+
+            collectPendingRewards(player);
+        }
+
+        require(pending[player.toCompactForm()].unlockTimestamp == 0);
+
+        // copy to storage
+        pending[player.toCompactForm()] = adventure.getReward(player);
+
+        emit AdventureStarted(msg.sender, player, adventure, pending[player.toCompactForm()]);
+    }
+
+    function somewhatRandomInRange(uint low, uint high) internal view returns(uint) {
+        return uint(keccak256(abi.encodePacked(block.timestamp, msg.sender, blockhash(block.number - 1)))) % (high - low) + low;
+    }
+}
+
+
+// XP is a non-transferable reward
+contract Experience is Ownable, Reward {
+    using PlayerFunctions for Player;
 
     // 12 first bytes are token id, last 20 bytes are address
     // e.g. can either refer to a specific Loot NFT (tokenId: 42, address: LOOT_ADDRESS)
     // or just a regular address, in which case we use the Synthetic Loot for that address
     mapping(uint => uint) accruedXP;
 
-    mapping(uint => PendingXP) pendingXP;
+    AdventureRegistry registry;
 
-    // initially just LOOT, but expandable
-    mapping(address => bool) levelableContracts;
-
-    // a dungeon is a contract that is allowed to timelock a player
-    mapping(address => bool) approvedDungeons;
-
-    constructor() {
-        levelableContracts[LOOT_ADDRESS] = true;
+    function init(address registryAddress) external onlyOwner  {
+        registry = AdventureRegistry(registryAddress);
     }
 
-    function setContractLevelable(address contractAddress, bool levelable) external onlyOwner {
-        require(contractAddress.isContract(), "contractAddress must be a contract");
-        levelableContracts[contractAddress] = levelable;
-    }
-
-    function setDungeonContract(address contractAddress, bool approved) external onlyOwner {
-        require(contractAddress.isContract(), "contractAddress must be a contract");
-        approvedDungeons[contractAddress] = approved;
-    }
-
-    function enterDungeonWithSyntheticLoot(address player) external {
-        require(approvedDungeons[msg.sender], "can only be called from a real Dungeon, for adventurers");
-        require(Dungeon(msg.sender).canEnter(player), "player is not allowed to enter this dungeon");
-
-        // TODO: double check if this makes sense. Maybe have the player call this directly instead, saying "I want to enter _this_ dungeon"
-        require(player == tx.origin, "only player can enter itself");
-
-        if (hasPendingRewards(player)) {
-            require(pendingRewardsReady(player), "player is already adventuring");
-
-            // collect the pending rewards
-            PendingXP storage pendingForPlayer = pendingXP[player];
-            accruedXP[player] += pendingForPlayer.reward;
-
-            // and reset them
-            pendingForPlayer.reward = 0;
-            pendingForPlayer.unlockTimestamp = 0;
-        }
-
-        _enterDungeon(player, player, 0);
-    }
-
-    function hasPendingRewards(address player) public view returns(bool) {
-        return pendingXP[player].unlockTimestamp != 0;
-    }
-
-    function pendingRewardsReady(address player) public view returns(bool) {
-        return pendingXP[player].unlockTimestamp <= now;
-    }
-
-    function totalXP(address player) public view returns(uint) {
-        if (hasPendingRewards(player) && pendingRewardsReady(player)) {
-            return accruedXP[player] + pendingXP[player].reward;
-        }
-
-        return accruedXP[player];
-    }
-
-    function levelOf(address player) public view returns(uint) {
-        uint xp = totalXP(player);
-        if (xp > 355000) { return 20; }
-        else if (xp > 305000) { return 19; }
-        else if (xp > 265000) { return 18; }
-        else if (xp > 225000) { return 17; }
-        else if (xp > 195000) { return 16; }
-        else if (xp > 165000) { return 15; }
-        else if (xp > 140000) { return 14; }
-        else if (xp > 120000) { return 13; }
-        else if (xp > 100000) { return 12; }
-        else if (xp > 85000) { return 11; }
-        else if (xp > 64000) { return 10; }
-        else if (xp > 48000) { return 9; }
-        else if (xp > 34000) { return 8; }
-        else if (xp > 23000) { return 7; }
-        else if (xp > 14000) { return 6; }
-        else if (xp > 6500) { return 5; }
-        else if (xp > 2700) { return 4; }
-        else if (xp > 900) { return 3; }
-        else if (xp > 300) { return 2; }
+    function levelOf(Player calldata player) public view returns(uint) {
+        uint xp = accruedXP[player.toCompactForm()];
+        if (xp > 4428675) { return 20; }
+        else if (xp > 2952450) { return 19; }
+        else if (xp > 1968300) { return 18; }
+        else if (xp > 1312200) { return 17; }
+        else if (xp > 874800) { return 16; }
+        else if (xp > 583200) { return 15; }
+        else if (xp > 388800) { return 14; }
+        else if (xp > 259200) { return 13; }
+        else if (xp > 172800) { return 12; }
+        else if (xp > 115200) { return 11; }
+        else if (xp > 76800) { return 10; }
+        else if (xp > 51200) { return 9; }
+        else if (xp > 25600) { return 8; }
+        else if (xp > 12800) { return 7; }
+        else if (xp > 6400) { return 6; }
+        else if (xp > 3200) { return 5; }
+        else if (xp > 1600) { return 4; }
+        else if (xp > 800) { return 3; }
+        else if (xp > 400) { return 2; }
         else { return 1; }
     }
 
-    function enterDungeonWithRealLoot(address player, address levelable, uint tokenId) external {
-        require(approvedDungeons[msg.sender], "can only be called from a real Dungeon, for adventurers");
-        require(Dungeon(msg.sender).canEnterWithRealLoot(player, levelable, tokenId), "player is not allowed to enter this dungeon");
+    function accrue(Player calldata player, uint amount) public override {
+        require(msg.sender == address(registry), "only callable from AdventureRegistry");
 
-        require(levelableContracts[levelable], "not a levellable contract");
-        require(ERC721(levelable).ownerOf(tokenId) == player, "player is not the owner of this Loot");
-        
-        // TODO: check for pending rewards for item
-
-        _enterDungeon(player, player, 0);
-    }
-    
-    function _enterDungeon(address player, address levelable, uint tokenId, Dungeon dungeon) internal {
-        // TODO: deal with real item
-        PendingXP storage pendingForPlayer = pendingXP[player];
-        require(pendingForPlayer.unlockTimestamp == 0);
-        
-        pendingForPlayer.unlockTimestamp = dungeon.getTimeToComplete();
-
-        // TODO: expandable kinds of rewards
-        (uint low, uint high) = dungeon.getXPReward();
-        pendingForPlayer.reward = somewhatRandomInRange(low, high);
+        accruedXP[player.toCompactForm()] += amount;
     }
 
-    function somewhatRandomInRange(uint low, uint high) internal view returns(uint) {
-        return uint(keccak256(abi.encodePacked(now, msg.sender, block.blockhash(block.number - 1)))) % (high - low) + low;
+    function balance(Player calldata player) public override view returns(uint) {
+        return accruedXP[player.toCompactForm()];
+    }
+
+    function name() pure external override returns(string memory) {
+        return "XP";
     }
 }
 
 
-contract BasicLootDungeon is Ownable, Dungeon {
-    function name() pure external returns(string) {
+contract BasicLootDungeon is Ownable, Adventure {
+    uint constant TIME_TO_COMPLETE = 20 minutes;
+    Experience xp;
+
+    function init(address experienceContractAddress) external onlyOwner {
+        xp = Experience(experienceContractAddress);
+    }
+
+    function name() pure external override returns(string memory) {
         return "Dungeon of noobing";
     }
 
-    function canEnter(address player) pure external returns(bool, string) {
+    function canEnter(Player calldata) pure external override returns(bool, string memory) {
         return (true, "all are welcome");
     }
 
-    function canEnterWithRealLoot(address player, address contractAddress, uint tokenId) pure external returns(bool, string) {
-        return canEnter(player);
+    function getTimeToComplete() pure public override returns(uint) {
+        return TIME_TO_COMPLETE;
     }
 
-    function getTimeToComplete() pure external returns(uint) {
-        return 20 minutes;
-    }
-
-    function getXPReward() pure external returns(uint, uint) {
-        return (100, 200);
+    function getReward(Player calldata) view external override returns(PendingReward memory) {
+        PendingReward memory reward;
+        reward.unlockTimestamp = block.timestamp + getTimeToComplete();
+        reward.rewardContract = address(xp);
+        reward.minAmount = 100;
+        reward.maxAmount = 200;
+        return reward;
     }
 }
 
 
-contract Level2LootDungeon is Ownable, Dungeon {
-    LootXP lootxp;
+contract Level2LootDungeon is Ownable, Adventure {
+    uint constant TIME_TO_COMPLETE = 30 minutes;
+    Experience xp;
 
-    function init(address lootxpAddress) onlyOwner {
-        lootxp = LootXP(lootxpAddress);
+    function init(address experienceContractAddress) external onlyOwner {
+        xp = Experience(experienceContractAddress);
     }
 
-    function name() pure external returns(string) {
+    function name() pure external override returns(string memory) {
         return "Dungeon of unremarkable dangers";
     }
 
-    function canEnter(address player) pure external returns(bool, string) {
-        return lootxp.levelOf(player) > 2;
+    function canEnter(Player calldata player) view external override returns(bool, string memory) {
+        return (xp.levelOf(player) > 2, "player must be at least level 2 to enter this dungeon");
     }
 
-    function canEnterWithRealLoot(address player, address contractAddress, uint tokenId) pure external returns(bool, string) {
-        return canEnter(player);
+    function getTimeToComplete() pure external override returns(uint) {
+        return TIME_TO_COMPLETE;
     }
 
-    function getTimeToComplete() pure external returns(uint) {
-        return 30 minutes;
-    }
-
-    function getXPReward() pure external returns(uint, uint) {
-        return (150, 400);
+    function getReward(Player calldata) view external override returns(PendingReward memory) {
+        PendingReward memory reward;
+        reward.unlockTimestamp = block.timestamp + TIME_TO_COMPLETE;
+        reward.rewardContract = address(xp);
+        reward.minAmount = 150;
+        reward.maxAmount = 400;
+        return reward;
     }
 }
